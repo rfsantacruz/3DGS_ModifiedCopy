@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -N gs_kfold_mmor
+#PBS -J 1-5
+#PBS -l select=1:ncpus=6:ngpus=1:mem=32gb:gpu_id=H100
+#PBS -l walltime=2:00:00
+#PBS -j oe
+
+# Change to the nerf or directory
+micromamba activate 3dgs_env
+cd /home/fonseca2/gaussian_splatting/gaussian-splatting
+
+# print experiment name
+echo "Experiment: ${PBS_JOBNAME}"
+
+echo "Extra args: ${GS_EXTRA_ARGS}"
+
+# selected dataset
+echo "Dataset: ${DATASET}"
+
+# Use PBS_ARRAYID to differentiate between array jobs
+echo "Running array job ${PBS_ARRAY_INDEX}"
+
+# Calculate test camera (1-5) and frame index (0-9) from PBS_ARRAY_INDEX
+TEST_CAMERA=$(( ((PBS_ARRAY_INDEX - 1) % 5) + 1 ))
+FRAME_INDEX=$(( (PBS_ARRAY_INDEX - 1) / 5 ))
+
+
+# Compute remaining cameras (all cameras except test camera)
+TRAIN_CAMERAS=""
+for cam in {1..5}; do
+    if [ $cam -ne $TEST_CAMERA ]; then
+        if [ -z "$TRAIN_CAMERAS" ]; then
+            TRAIN_CAMERAS="$cam"
+        else
+            TRAIN_CAMERAS="$TRAIN_CAMERAS $cam"
+        fi
+    fi
+done
+
+echo "Test Camera: $TEST_CAMERA"
+echo "Training Cameras: $TRAIN_CAMERAS"
+
+# # Your command here - use ${PBS_ARRAYID} to process different inputs
+# # train model
+echo "TRAINING"
+python train.py -s "/home/fonseca2/dataset/MM-OR-Prep/${DATASET}" -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" -r 1 --train_cam_ids "$TRAIN_CAMERAS" --save_iterations 250 500 1000 2500 5000 --disable_viewer --iterations 5000 $GS_EXTRA_ARGS
+
+# render all cameras with the trained model
+echo "RENDRING"
+python render.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" --iteration 250
+python render.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" --iteration 500
+python render.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" --iteration 1000
+python render.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" --iteration 2500
+python render.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}" --iteration 5000
+
+# compute metrics
+echo "METRICS"
+python metrics.py -m "./output/${PBS_JOBNAME}/Eval_Frame${DATASET}_TestCamera${TEST_CAMERA}"
+
+

@@ -1,0 +1,10 @@
+#!/bin/bash
+#PBS -N optuna_job
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_id=H100
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+# Change to the nerf or directory
+micromamba activate 3dgs_env
+cd /home/fonseca2/gaussian_splatting/gaussian-splatting/pbs/opt
+python optuna_4DOR.py

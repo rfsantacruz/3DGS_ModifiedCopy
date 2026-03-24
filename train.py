@@ -21,8 +21,9 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import MiniCam
 from utils.general_utils import safe_state, get_expon_lr_func
-from utils.graphics_utils import fov2focal, rgbd_to_pointcloud
+from utils.graphics_utils import fov2focal, rgbd_to_pointcloud, sample_virtual_fps, pointcloud_to_rgbd_batch
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -68,34 +69,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-
+        
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_Ll1depthgrad_for_log = 0.0
+    ema_L1virtreg_for_log = 0.0
     
-    # create point cloud for regularization from RGBD views (if available)
-    rgbd_pcd_points, rgbd_pcd_cols = [], []
-    for viewpoint_cam in viewpoint_stack:                
-        fy = fov2focal(viewpoint_cam.FoVy, viewpoint_cam.image_height); fx = fov2focal(viewpoint_cam.FoVx, viewpoint_cam.image_width);
-        cx = viewpoint_cam.image_width / 2; cy = viewpoint_cam.image_height / 2
-        camera_to_world = viewpoint_cam.world_view_transform.inverse()
-        depth_map = viewpoint_cam.sensorinvdepthmap.cuda()
-        depth_map = torch.where(viewpoint_cam.sensor_depth_mask.cuda() > 0, 1.0/depth_map, torch.zeros_like(depth_map)).squeeze()
-        rgb = viewpoint_cam.original_image.permute(1,2,0)
-        pts , cols = rgbd_to_pointcloud(rgb, depth_map,  torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device="cuda"), camera_to_world, max_depth=3.0)
-        rgbd_pcd_points.append(pts); rgbd_pcd_cols.append(cols);        
-    rgbd_pcd_points = torch.cat(rgbd_pcd_points, dim=0); rgbd_pcd_cols = torch.cat(rgbd_pcd_cols, dim=0);
-    # compute center and mean distance to center for these points, for later use in regularization
-    scene_center = torch.mean(rgbd_pcd_points, axis=0)
-    mean_distance = 0.0
-    for viewpoint_cam in viewpoint_stack:
-        mean_distance += torch.linalg.norm(viewpoint_cam.camera_center - scene_center)
-    mean_distance /= len(viewpoint_stack)
     # python train.py -s "/home/fonseca2/dataset/MM-OR-Prep/001_PKA_3393_KS0" -m "./output/DEBUG_REG/Eval_Frame3393_TestCamera5" -r 1 --train_cam_ids "1 2 3 4" --save_iterations 500 1000 1500 2000 --disable_viewer --iterations 2000 --sensor_depths sensor_depth
+    # for virtual camera regularization
+    rgbd_pcd_points, rgbd_pcd_cols, camera_centers = [], [], []
+    if opt.virtual_view_reg_weight > 0:
+        for viewpoint_cam in viewpoint_stack:                
+            fy = fov2focal(viewpoint_cam.FoVy, viewpoint_cam.image_height); fx = fov2focal(viewpoint_cam.FoVx, viewpoint_cam.image_width);
+            cx = viewpoint_cam.image_width / 2; cy = viewpoint_cam.image_height / 2
+            intrinsics = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device='cuda')
+            
+            camera_to_world = viewpoint_cam.world_view_transform.inverse()
+            camera_centers.append(viewpoint_cam.camera_center)
+            
+            depth_map = viewpoint_cam.sensorinvdepthmap.cuda()
+            depth_map = torch.where(viewpoint_cam.sensor_depth_mask.cuda() > 0, 1.0/depth_map, torch.zeros_like(depth_map)).squeeze()
+            
+            rgb = viewpoint_cam.original_image.permute(1,2,0)
+            
+            pts , cols = rgbd_to_pointcloud(rgb, depth_map,  intrinsics, camera_to_world, max_depth=3.0)
+            rgbd_pcd_points.append(pts); rgbd_pcd_cols.append(cols);        
+        rgbd_pcd_points = torch.vstack(rgbd_pcd_points); rgbd_pcd_cols = torch.vstack(rgbd_pcd_cols); camera_centers = torch.vstack(camera_centers)
+        # compute center and mean distance to center for these points, for later use in regularization
+        scene_center = torch.mean(rgbd_pcd_points, axis=0)
+        scene_radius = torch.mean(torch.linalg.norm(camera_centers - scene_center[None], dim=1))
     
-
+    
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -190,18 +196,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # virtual view regularization from RGBD point cloud
-        if len(rgbd_pcd_points) > 0:
-            # sample n virtual viewpoints
+        # python train.py -s "/home/fonseca2/dataset/MM-OR-Prep/001_PKA_3393_KS0" -m "./output/DEBUG_REG/Eval_Frame3393_TestCamera5" -r 1 --train_cam_ids "1 2 3 4" --save_iterations 500 1000 1500 2000 --disable_viewer --iterations 2000 --sensor_depths sensor_depth
+        if opt.virtual_view_reg_weight > 0:
             
-            # backproject points to these viewpoints to render color and dpeths
+            # setup virtual cameras using farthest point sampling on a sphere around the scene, with the original camera as anchor
+            num_virtual_cams = 3
+            virtual_cameras = sample_virtual_fps(scene_center, scene_radius, viewpoint_cam.camera_center, num_samples=num_virtual_cams)            
+            R = virtual_cameras[:, :3, :3]  # (B, 3, 3)
+            t = virtual_cameras[:, :3, 3]   # (B, 3)    
+            virtual_world_to_camera = torch.zeros_like(virtual_cameras)       # (B, 4, 4)
+            virtual_world_to_camera[:, :3, :3] = R.transpose(1, 2)            # R^T
+            virtual_world_to_camera[:, :3, 3] = -(R.transpose(1, 2) @ t.unsqueeze(-1)).squeeze(-1)  # -R^T @ t
+            virtual_world_to_camera[:, 3, 3] = 1.0
+            virtual_world_to_camera = virtual_world_to_camera.detach()
             
-            # render depth and color from the model at these viewpoints
+            # intrinsics for virtual cameras (same as real camera, could be improved by randomization or other heuristics)
+            fy = fov2focal(viewpoint_cam.FoVy, viewpoint_cam.image_height); fx = fov2focal(viewpoint_cam.FoVx, viewpoint_cam.image_width);
+            cx = viewpoint_cam.image_width / 2; cy = viewpoint_cam.image_height / 2
+            intrinsics = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device='cuda').unsqueeze(0).expand(virtual_cameras.shape[0], -1, -1)
+            intrinsics = intrinsics.detach()
             
-            # loss on color and depth, weighted with depth_l1_weight(iteration) and added to the total loss
-            rgbd_reg_loss = 0.0
-            loss += rgbd_reg_loss
+            # compute virtual RGBD images by rendering the RGBD point cloud from these virtual views
+            virtual_rgbs, virtual_depths = pointcloud_to_rgbd_batch(rgbd_pcd_points, rgbd_pcd_cols, intrinsics, virtual_world_to_camera, viewpoint_cam.image_width, viewpoint_cam.image_height)
+            virtual_rgbs = virtual_rgbs.permute(0,3,1,2).detach(); virtual_depths = virtual_depths.unsqueeze(1).expand(-1, 3, -1, -1).detach();  
+            virtual_mask = virtual_depths > 0  # B, C, H, W             
+            
+            # render the model from the same virtual views
+            render_rgb_virt = []
+            for v in range(num_virtual_cams):
+                # Transpose to match 3DGS row-major convention
+                w2c = virtual_world_to_camera[v].T  
+                full_proj = (w2c.unsqueeze(0).bmm(viewpoint_cam.projection_matrix.unsqueeze(0))).squeeze(0)                
+                virtual_cam = MiniCam(width=viewpoint_cam.image_width, height=viewpoint_cam.image_height, fovy=viewpoint_cam.FoVy, fovx=viewpoint_cam.FoVx, 
+                                      znear=viewpoint_cam.znear, zfar=viewpoint_cam.zfar, world_view_transform=w2c, full_proj_transform=full_proj)
+                
+                render_pkg_virt = render(virtual_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, is_train=True, iteration_ratio=iteration/opt.iterations)
+                render_rgb_virt.append(render_pkg_virt["render"])
+            render_rgb_virt = torch.stack(render_rgb_virt, dim=0) # (B, C, H, W)
+            
+            virt_reg_loss = torch.abs((render_rgb_virt[virtual_mask] - virtual_rgbs[virtual_mask])).mean()
+            loss += virt_reg_loss * opt.virtual_view_reg_weight
+            virt_reg_loss = virt_reg_loss.item()
         else:
-            rgbd_reg_loss = 0.0
+            virt_reg_loss = 0.0
+            
 
         loss.backward()
 
@@ -211,16 +249,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1sensordepth + 0.6 * ema_Ll1depth_for_log
-            ema_Ll1depthgrad_for_log = 0.4 * Ll1mldepthgrad + 0.6 * ema_Ll1depthgrad_for_log
+            ema_Ll1depthgrad_for_log = 0.4 * Ll1mldepthgrad + 0.6 * ema_Ll1depthgrad_for_log 
+            ema_L1virtreg_for_log = 0.4 * virt_reg_loss + 0.6 * ema_L1virtreg_for_log           
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Depth Grad": f"{ema_Ll1depthgrad_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Depth Grad": f"{ema_Ll1depthgrad_for_log:.{7}f}", "Virt Reg": f"{ema_L1virtreg_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, Ll1sensordepth, Ll1mldepthgrad, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, Ll1sensordepth, Ll1mldepthgrad, virt_reg_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -279,11 +318,12 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, L1sensordepth, L1mldepthgrad, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, L1sensordepth, L1mldepthgrad, L1virtreg, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1sensordepth', L1sensordepth, iteration)
         tb_writer.add_scalar('train_loss_patches/l1mldepthgrad', L1mldepthgrad, iteration)
+        tb_writer.add_scalar('train_loss_patches/l1virtreg', L1virtreg, iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 

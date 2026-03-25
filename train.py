@@ -86,7 +86,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             cx = viewpoint_cam.image_width / 2; cy = viewpoint_cam.image_height / 2
             intrinsics = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device='cuda')
             
-            camera_to_world = viewpoint_cam.world_view_transform.inverse()
+            camera_to_world = viewpoint_cam.world_view_transform.T.inverse()
             camera_centers.append(viewpoint_cam.camera_center)
             
             depth_map = viewpoint_cam.sensorinvdepthmap.cuda()
@@ -201,7 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # setup virtual cameras using farthest point sampling on a sphere around the scene, with the original camera as anchor
             num_virtual_cams = 3
-            virtual_cameras = sample_virtual_fps(scene_center, scene_radius, viewpoint_cam.camera_center, num_samples=num_virtual_cams)            
+            virtual_cameras = sample_virtual_fps(scene_center, scene_radius, num_samples=num_virtual_cams)            
             R = virtual_cameras[:, :3, :3]  # (B, 3, 3)
             t = virtual_cameras[:, :3, 3]   # (B, 3)    
             virtual_world_to_camera = torch.zeros_like(virtual_cameras)       # (B, 4, 4)
@@ -219,8 +219,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # compute virtual RGBD images by rendering the RGBD point cloud from these virtual views
             virtual_rgbs, virtual_depths = pointcloud_to_rgbd_batch(rgbd_pcd_points, rgbd_pcd_cols, intrinsics, virtual_world_to_camera, viewpoint_cam.image_width, viewpoint_cam.image_height)
             virtual_rgbs = virtual_rgbs.permute(0,3,1,2).detach(); virtual_depths = virtual_depths.unsqueeze(1).expand(-1, 3, -1, -1).detach();  
-            virtual_mask = virtual_depths > 0  # B, C, H, W             
-            
+            virtual_mask = virtual_depths > 0  # B, C, H, W         
+        
             # render the model from the same virtual views
             render_rgb_virt = []
             for v in range(num_virtual_cams):

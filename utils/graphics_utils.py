@@ -14,6 +14,7 @@ import math
 import numpy as np
 from typing import NamedTuple
 
+
 class BasicPointCloud(NamedTuple):
     points : np.array
     colors : np.array
@@ -129,54 +130,77 @@ def rgbd_to_pointcloud(rgb_image, depth_image, intrinsics, camera_to_world, max_
     return points_world, colors
 
 
-def sample_virtual_fps(scene_center, radius, anchor_position, num_samples, n_candidates=4096):
+def angular_distance(p1, p2, center, radius):
+    u1 = (p1 - center[None]) / radius  # (N, 3)
+    u2 = (p2 - center[None]) / radius  # (M, 3)
+    dot = u1 @ u2.T                     # (N, M)
+    dot = torch.clamp(dot, -1.0, 1.0)
+    return torch.acos(dot)              # (N, M)
+
+
+_candidate_pool = None
+
+
+def _generate_candidate_pool(scene_center, radius, device, n_candidates=4096):
+    u = torch.rand(n_candidates, device=device)
+    v = torch.rand(n_candidates, device=device)
+
+    y = u
+    r = torch.sqrt(1.0 - y * y)
+    phi = 2 * torch.pi * v
+
+    directions = torch.stack([
+        r * torch.cos(phi),
+        y,
+        r * torch.sin(phi),
+    ], dim=1)
+
+    return scene_center.unsqueeze(0) + radius * directions 
+
+
+def sample_virtual_fps(scene_center, radius, num_samples):
     """
     Sample virtual camera positions on the upper hemisphere using farthest point sampling (PyTorch).
 
     Args:
         scene_center: (3,) tensor — center of the scene
         radius: float — radius of the hemisphere
-        anchor_position: (3,) tensor — seed camera position for FPS
-        num_samples: int — number of new cameras to sample
-        n_candidates: int — number of candidate points on the hemisphere
+        num_samples: int — number of new cameras to sample        
 
     Returns:
         cameras_c2w: (num_samples, 4, 4) tensor of camera-to-world matrices
     """
-    device = anchor_position.device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Generate candidate points on upper hemisphere
-    u = torch.rand(n_candidates, device=device)
-    v = torch.rand(n_candidates, device=device)
-    theta = torch.arccos(1 - u)
-    phi = 2 * torch.pi * v
+    global _candidate_pool
+    if (_candidate_pool is None or _candidate_pool.shape[0] < num_samples):
+        print(f"Generating new candidate pool of {4096} points for virtual camera sampling...")
+        _candidate_pool = _generate_candidate_pool(scene_center, radius, device, n_candidates=4096)
+    
+         
+    # Pick first point randomly
+    init_idx = torch.randint(0, _candidate_pool.shape[0], (1,)).item()
+    selected = _candidate_pool[init_idx].unsqueeze(0)
+    mask = torch.ones(_candidate_pool.shape[0], dtype=torch.bool, device=device); mask[init_idx] = False;
+    _candidate_pool = _candidate_pool[mask]
 
-    directions = torch.stack([
-        torch.sin(theta) * torch.cos(phi),
-        torch.cos(theta),
-        torch.sin(theta) * torch.sin(phi),
-    ], dim=1)  # (n_candidates, 3)
-
-    candidates = scene_center.unsqueeze(0) + radius * directions  # (n_candidates, 3)
-
-    # FPS with anchor as seed
-    selected = anchor_position.unsqueeze(0)  # (1, 3)
-
-    new_positions = []
-    for _ in range(num_samples):
-        dists = torch.cdist(candidates, selected)  # (n_candidates, M)
-        min_dists = dists.min(dim=1).values         # (n_candidates,)
+    selected_idxs = []
+    for _ in range(num_samples - 1):
+        dists = angular_distance(_candidate_pool, selected, scene_center, radius)
+        min_dists = dists.min(dim=1).values
         farthest_idx = torch.argmax(min_dists)
-        new_pos = candidates[farthest_idx]
-        new_positions.append(new_pos)
-        selected = torch.cat([selected, new_pos.unsqueeze(0)], dim=0)
+        selected_idxs.append(farthest_idx.item())
+        selected = torch.cat([selected, _candidate_pool[farthest_idx].unsqueeze(0)], dim=0)
 
-    new_positions = torch.stack(new_positions, dim=0)  # (num_samples, 3)
+    # Remove from pool
+    mask = torch.ones(_candidate_pool.shape[0], dtype=torch.bool, device=device); mask[selected_idxs] = False;
+    _candidate_pool = _candidate_pool[mask]
 
+    
     # Build camera-to-world matrices (look at scene_center)
     up = torch.tensor([0.0, -1.0, 0.0], device=device)
 
-    z_axes = scene_center.unsqueeze(0) - new_positions  # (N, 3)
+    z_axes = scene_center.unsqueeze(0) - selected  # (N, 3)
     z_axes = z_axes / z_axes.norm(dim=1, keepdim=True)
 
     x_axes = torch.linalg.cross(up.unsqueeze(0).expand_as(z_axes), z_axes)
@@ -188,7 +212,7 @@ def sample_virtual_fps(scene_center, radius, anchor_position, num_samples, n_can
     cameras_c2w[:, :3, 0] = x_axes
     cameras_c2w[:, :3, 1] = y_axes
     cameras_c2w[:, :3, 2] = z_axes
-    cameras_c2w[:, :3, 3] = new_positions
+    cameras_c2w[:, :3, 3] = selected
     cameras_c2w[:, 3, 3] = 1.0
 
     return cameras_c2w
